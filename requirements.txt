@@ -1,5 +1,5 @@
 streamlit
 tensorflow
-ultralytics
+ultralytics-opencv-headless
 Pillow
 requests
