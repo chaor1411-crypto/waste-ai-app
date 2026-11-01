@@ -2,12 +2,16 @@ import base64
 import csv
 import hashlib
 import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import streamlit as st
-import tensorflow as tf
 import requests
 from PIL import Image, ImageDraw, ImageOps
 from ultralytics import YOLO
@@ -36,6 +40,7 @@ CLASSIFIER_PATH = (
     / "models"
     / "final_waste_classifier.keras"
 )
+CLASSIFIER_WORKER_PATH = BASE_DIR / "classifier_worker.py"
 
 FEEDBACK_DIR = BASE_DIR / "feedback_data"
 FEEDBACK_CSV = FEEDBACK_DIR / "feedback_log.csv"
@@ -105,28 +110,33 @@ for class_name in CLASS_NAMES:
 
 # ============================================================
 # 5. 모델 로딩
+#    - Streamlit 메인 프로세스에는 YOLO(PyTorch)만 로드
+#    - MobileNetV2(TensorFlow)는 classifier_worker.py에서 별도 실행
 # ============================================================
 
 @st.cache_resource
-def load_models():
+def load_yolo_model():
 
-    yolo = YOLO(str(YOLO_PATH))
-
-    classifier = tf.keras.models.load_model(
-        str(CLASSIFIER_PATH)
-    )
-
-    return yolo, classifier
+    return YOLO(str(YOLO_PATH))
 
 
 try:
 
-    yolo_model, classifier = load_models()
+    yolo_model = load_yolo_model()
 
 except Exception as e:
 
-    st.error("AI 모델을 불러오지 못했습니다.")
+    st.error("YOLO 모델을 불러오지 못했습니다.")
     st.exception(e)
+    st.stop()
+
+
+if not CLASSIFIER_WORKER_PATH.exists():
+
+    st.error(
+        "classifier_worker.py 파일이 없습니다. "
+        "GitHub 저장소의 app.py와 같은 위치에 추가해주세요."
+    )
     st.stop()
 
 
@@ -497,6 +507,111 @@ def save_feedback(
 # 8. 이미지 분석 함수
 # ============================================================
 
+def run_classifier_worker(crops):
+    """
+    MobileNetV2 분류를 별도 Python 프로세스에서 실행합니다.
+    메인 프로세스는 PyTorch만, worker는 TensorFlow만 사용합니다.
+    """
+
+    if not crops:
+        return []
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        temp_dir = Path(temp_dir)
+        image_paths = []
+
+        for index, crop in enumerate(crops):
+
+            crop_path = temp_dir / f"crop_{index}.jpg"
+
+            crop.convert("RGB").save(
+                crop_path,
+                format="JPEG",
+                quality=95
+            )
+
+            image_paths.append(str(crop_path))
+
+        payload = {
+            "model_path": str(CLASSIFIER_PATH),
+            "image_paths": image_paths,
+            "input_size": 320
+        }
+
+        worker_env = os.environ.copy()
+        worker_env["CUDA_VISIBLE_DEVICES"] = "-1"
+        worker_env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        worker_env["TF_NUM_INTEROP_THREADS"] = "1"
+        worker_env["TF_NUM_INTRAOP_THREADS"] = "1"
+        worker_env["OMP_NUM_THREADS"] = "1"
+
+        try:
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLASSIFIER_WORKER_PATH)
+                ],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=worker_env
+            )
+
+        except subprocess.TimeoutExpired:
+
+            raise RuntimeError(
+                "재질 분류 시간이 너무 오래 걸려 중단되었습니다. "
+                "다시 시도해주세요."
+            )
+
+        if completed.returncode != 0:
+
+            error_message = (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or "알 수 없는 worker 오류"
+            )
+
+            raise RuntimeError(
+                "MobileNet 분류 프로세스 실행 실패:\n"
+                f"{error_message[-2500:]}"
+            )
+
+        result_line = None
+
+        for line in reversed(completed.stdout.splitlines()):
+
+            if line.startswith("__CLASSIFIER_RESULT__"):
+                result_line = line
+                break
+
+        if result_line is None:
+            raise RuntimeError(
+                "MobileNet 분류 결과를 읽지 못했습니다."
+            )
+
+        result_json = result_line.replace(
+            "__CLASSIFIER_RESULT__",
+            "",
+            1
+        )
+
+        result = json.loads(result_json)
+
+        if not result.get("ok", False):
+            raise RuntimeError(
+                result.get(
+                    "error",
+                    "MobileNet 분류 중 오류가 발생했습니다."
+                )
+            )
+
+        return result["predictions"]
+
+
 def analyze_image(image):
 
     image_np = np.array(image)
@@ -510,15 +625,13 @@ def analyze_image(image):
             iou=0.45,
             agnostic_nms=True,
             max_det=10,
-            verbose=False
+            verbose=False,
+            device="cpu"
         )
 
     except Exception as e:
 
-        st.error(
-            "폐기물 탐지 과정에서 오류가 발생했습니다."
-        )
-
+        st.error("폐기물 탐지 과정에서 오류가 발생했습니다.")
         st.exception(e)
         st.stop()
 
@@ -530,36 +643,22 @@ def analyze_image(image):
 
         x1, y1, x2, y2 = map(
             int,
-            box.xyxy[0]
-            .cpu()
-            .numpy()
+            box.xyxy[0].cpu().numpy()
         )
 
         x1 = max(0, x1)
         y1 = max(0, y1)
-
-        x2 = min(
-            image.width,
-            x2
-        )
-
-        y2 = min(
-            image.height,
-            y2
-        )
+        x2 = min(image.width, x2)
+        y2 = min(image.height, y2)
 
         if x2 <= x1 or y2 <= y1:
             continue
 
-        yolo_class_id = int(
-            box.cls[0]
-        )
+        yolo_class_id = int(box.cls[0])
 
-        yolo_class = (
-            yolo_model.names[
-                yolo_class_id
-            ]
-        )
+        yolo_class = yolo_model.names[
+            yolo_class_id
+        ]
 
         yolo_confidence = float(
             box.conf[0]
@@ -573,8 +672,7 @@ def analyze_image(image):
                     x2,
                     y2
                 ),
-                "yolo_class":
-                    yolo_class,
+                "yolo_class": yolo_class,
                 "yolo_confidence":
                     yolo_confidence
             }
@@ -585,26 +683,20 @@ def analyze_image(image):
     )
 
     output_image = image.copy()
+    draw = ImageDraw.Draw(output_image)
 
-    draw = ImageDraw.Draw(
-        output_image
-    )
+    if not clean_boxes:
 
-    detected_objects = []
+        return {
+            "output_image": output_image,
+            "detected_objects": []
+        }
+
+    crops = []
 
     for item in clean_boxes:
 
-        x1, y1, x2, y2 = (
-            item["box"]
-        )
-
-        yolo_class = (
-            item["yolo_class"]
-        )
-
-        yolo_confidence = (
-            item["yolo_confidence"]
-        )
+        x1, y1, x2, y2 = item["box"]
 
         crop = image.crop(
             (
@@ -615,50 +707,58 @@ def analyze_image(image):
             )
         )
 
-        crop_resized = crop.resize(
-            (
-                320,
-                320
-            )
+        crops.append(crop.copy())
+
+    try:
+
+        classifier_predictions = (
+            run_classifier_worker(crops)
         )
 
-        crop_array = np.array(
-            crop_resized,
+    except Exception as e:
+
+        st.error(
+            "재질 분류 과정에서 오류가 발생했습니다."
+        )
+        st.exception(e)
+        st.stop()
+
+    if len(classifier_predictions) != len(
+        clean_boxes
+    ):
+
+        st.error(
+            "탐지된 객체 수와 재질 분류 결과 수가 일치하지 않습니다."
+        )
+        st.stop()
+
+    detected_objects = []
+
+    for item, crop, prediction in zip(
+        clean_boxes,
+        crops,
+        classifier_predictions
+    ):
+
+        x1, y1, x2, y2 = item["box"]
+
+        yolo_class = item["yolo_class"]
+        yolo_confidence = item[
+            "yolo_confidence"
+        ]
+
+        probabilities = np.asarray(
+            prediction,
             dtype=np.float32
         )
-
-        crop_array = np.expand_dims(
-            crop_array,
-            axis=0
-        )
-
-        try:
-
-            probabilities = (
-                classifier.predict(
-                    crop_array,
-                    verbose=0
-                )[0]
-            )
-
-        except Exception as e:
-
-            st.error(
-                "재질 분류 과정에서 오류가 발생했습니다."
-            )
-
-            st.exception(e)
-            st.stop()
 
         classifier_id = int(
             np.argmax(probabilities)
         )
 
-        classifier_class = (
-            CLASS_NAMES[
-                classifier_id
-            ]
-        )
+        classifier_class = CLASS_NAMES[
+            classifier_id
+        ]
 
         classifier_confidence = float(
             probabilities[
@@ -666,17 +766,12 @@ def analyze_image(image):
             ]
         )
 
-        # ----------------------------------------------------
-        # YOLO + MobileNet 결과 통합
-        # ----------------------------------------------------
-
         final_class = None
         decision = ""
 
         if classifier_confidence < 0.60:
 
             final_class = None
-
             decision = (
                 "AI 확신도가 낮아 "
                 "판단을 보류했습니다."
@@ -685,7 +780,6 @@ def analyze_image(image):
         elif yolo_class == classifier_class:
 
             final_class = classifier_class
-
             decision = (
                 "두 AI 모델의 판단이 일치했습니다."
             )
@@ -693,7 +787,6 @@ def analyze_image(image):
         elif classifier_confidence >= 0.90:
 
             final_class = classifier_class
-
             decision = (
                 "객체 탐지 모델과 재질 분류 모델의 "
                 "판단은 달랐지만 재질 분류 확신도가 "
@@ -703,7 +796,6 @@ def analyze_image(image):
         else:
 
             final_class = None
-
             decision = (
                 "두 AI 모델의 판단이 달라 "
                 "최종 판단을 보류했습니다."
@@ -711,46 +803,28 @@ def analyze_image(image):
 
         detected_objects.append(
             {
-                "final_class":
-                    final_class,
-
+                "final_class": final_class,
                 "classifier_class":
                     classifier_class,
-
                 "classifier_confidence":
                     classifier_confidence,
-
-                "yolo_class":
-                    yolo_class,
-
+                "yolo_class": yolo_class,
                 "yolo_confidence":
                     yolo_confidence,
-
-                "decision":
-                    decision,
-
+                "decision": decision,
                 "box": (
                     x1,
                     y1,
                     x2,
                     y2
                 ),
-
-                # 사용자가 정답을 수정하면
-                # 실제 재학습용 이미지로 저장할 crop
-                "crop":
-                    crop.copy()
+                "crop": crop.copy()
             }
         )
-
-        # ----------------------------------------------------
-        # Bounding Box 표시
-        # ----------------------------------------------------
 
         if final_class is None:
 
             box_color = "orange"
-
             label_text = (
                 "CHECK "
                 f"{classifier_confidence * 100:.1f}%"
@@ -759,7 +833,6 @@ def analyze_image(image):
         else:
 
             box_color = "lime"
-
             label_text = (
                 f"{final_class} "
                 f"{classifier_confidence * 100:.1f}%"
